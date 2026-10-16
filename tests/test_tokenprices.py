@@ -181,5 +181,108 @@ class TestCli(unittest.TestCase):
             self.assertIsNotNone(d.get("in") or d.get("out"), d["id"])
 
 
+class TestWatch(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.patch_cache = mock.patch("tokenprices.CACHE_DIR", Path(self.tmp.name))
+        self.patch_cache.start()
+
+    def tearDown(self):
+        self.patch_cache.stop()
+        self.tmp.cleanup()
+
+    def _args(self, query=("gpt-6.1-sol",), once=True, drop=0.0, watch_list=False,
+              watch_remove=None):
+        class A:
+            pass
+        a = A()
+        a.mode = "watch"
+        a.query = list(query)
+        a.source = "openrouter"
+        a.lang = "en"
+        a.watch_list = watch_list
+        a.watch_remove = watch_remove
+        a.once = once
+        a.interval = 3600
+        a.drop = drop
+        a.in_tokens = a.out_tokens = 0
+        a.calls_n = 1
+        a.refresh = a.offline = a.free = False
+        a.limit = 20
+        a.json = a.html = None
+        return a
+
+    def _models(self, inp, out):
+        return [{"id": "openai/gpt-6.1-sol", "provider": "openai",
+                 "in": inp, "out": out, "ctx": 1000000}]
+
+    def test_watch_baseline_then_drop(self):
+        seq = iter([self._models(2.0, 10.0), self._models(1.6, 10.0)])  # only input drops
+
+        def fake_fetch():
+            return next(seq)
+
+        with mock.patch("tokenprices.fetch_openrouter", side_effect=fake_fetch):
+            tp.cmd_watch(self._args(), "en")   # baseline at 2.0
+            tp.cmd_watch(self._args(), "en")   # price drops to 1.6
+        store = json.loads((Path(self.tmp.name) / "watch.json").read_text(encoding="utf-8"))
+        rec = store["openai/gpt-6.1-sol"]
+        self.assertEqual(rec["base_in"], 2.0)
+        self.assertEqual(rec["min_in"], 1.6)  # minimum tracked downward
+        self.assertEqual(len(rec["alerts"]), 1)
+
+        # a steady check now reports "no change", not another alert
+        buf = io.StringIO()
+        with mock.patch.object(sys, "stdout", buf), mock.patch(
+                "tokenprices.fetch_openrouter", return_value=self._models(1.6, 10.0)):
+            tp.cmd_watch(self._args(), "en")
+        self.assertNotIn("PRICE DROP", buf.getvalue())
+
+    def test_watch_drop_alert_content(self):
+        # first run baseline at 2.0, second run at 1.6 → alert with -20%
+        seq = iter([self._models(2.0, 10.0), self._models(1.6, 9.0)])
+
+        def fake_fetch():
+            return next(seq)
+
+        buf = io.StringIO()
+        with mock.patch.object(sys, "stdout", buf), mock.patch(
+                "tokenprices.fetch_openrouter", side_effect=fake_fetch):
+            tp.cmd_watch(self._args(), "en")
+            tp.cmd_watch(self._args(), "en")
+        self.assertIn("PRICE DROP", buf.getvalue())
+        self.assertIn("2.000", buf.getvalue())
+        self.assertIn("1.600", buf.getvalue())
+
+    def test_watch_threshold_suppresses_small_drops(self):
+        seq = iter([self._models(2.0, 10.0), self._models(1.9, 9.5)])  # -5%
+
+        def fake_fetch():
+            return next(seq)
+
+        buf = io.StringIO()
+        with mock.patch.object(sys, "stdout", buf), mock.patch(
+                "tokenprices.fetch_openrouter", side_effect=fake_fetch):
+            tp.cmd_watch(self._args(), "en")
+            tp.cmd_watch(self._args(drop=10.0), "en")  # only alert on >=10%
+        self.assertNotIn("PRICE DROP", buf.getvalue())
+        store = json.loads((Path(self.tmp.name) / "watch.json").read_text(encoding="utf-8"))
+        self.assertEqual(store["openai/gpt-6.1-sol"]["min_in"], 1.9)  # min still tracked
+
+    def test_watch_list_and_remove(self):
+        with mock.patch("tokenprices.fetch_openrouter", return_value=self._models(2.0, 10.0)):
+            tp.cmd_watch(self._args(), "en")
+        buf = io.StringIO()
+        with mock.patch.object(sys, "stdout", buf):
+            tp.cmd_watch(self._args(watch_list=True), "en")
+        self.assertIn("gpt-6.1-sol", buf.getvalue())
+        buf2 = io.StringIO()
+        with mock.patch.object(sys, "stdout", buf2):
+            tp.cmd_watch(self._args(watch_remove=["gpt-6.1-sol"]), "en")
+        self.assertIn("removed", buf2.getvalue())
+        store = json.loads((Path(self.tmp.name) / "watch.json").read_text(encoding="utf-8"))
+        self.assertEqual(store, {})
+
+
 if __name__ == "__main__":
     unittest.main()

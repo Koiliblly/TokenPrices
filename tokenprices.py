@@ -76,6 +76,12 @@ I18N = {
         "no_match": "No models matched", "error": "Error", "done": "done",
         "hint": "Tip: try `tokenprices search <name>`, `tokenprices compare a b c`, "
                 "`tokenprices cost --model X --in 1000 --out 500`, `tokenprices top 10`.",
+        "watch_in": "INPUT", "watch_out": "OUTPUT", "watch_drop": "PRICE DROP",
+        "watch_no_change": "no price change since last check",
+        "watch_baseline": "baseline set", "watch_checked": "checked",
+        "watch_list": "WATCHED MODELS", "watch_removed": "removed",
+        "watch_base": "BASE IN", "watch_min": "MIN IN", "watch_now": "NOW",
+        "watch_checks": "CHECKS", "watch_hint": "loop mode: Ctrl+C to stop",
     },
     "zh": {
         "model": "模型", "provider": "供应商", "in": "输入 $/百万", "out": "输出 $/百万",
@@ -87,6 +93,12 @@ I18N = {
         "no_match": "没有匹配的模型", "error": "错误", "done": "完成",
         "hint": "试试：`tokenprices search deepseek`、`tokenprices compare gpt-6.1-sol kimi-k3`、"
                 "`tokenprices cost --model X --in 1000 --out 500`、`tokenprices top 10`。",
+        "watch_in": "输入", "watch_out": "输出", "watch_drop": "价格下降",
+        "watch_no_change": "自上次检查价格未变化",
+        "watch_baseline": "已建立基准价", "watch_checked": "检查时间",
+        "watch_list": "监控中的模型", "watch_removed": "已移除",
+        "watch_base": "基准输入", "watch_min": "历史最低", "watch_now": "当前",
+        "watch_checks": "次数", "watch_hint": "循环模式：Ctrl+C 停止",
     },
 }
 
@@ -373,14 +385,165 @@ def resolve(models, query):
     return hits
 
 
+# --------------------------------------------------------------------------
+# Price-drop watch (定时监控)
+# --------------------------------------------------------------------------
+
+def _watch_path():
+    return CACHE_DIR / "watch.json"
+
+
+def _load_watch():
+    p = _watch_path()
+    if p.exists():
+        try:
+            return json.loads(p.read_text(encoding="utf-8"))
+        except Exception:
+            pass
+    return {}
+
+
+def _save_watch(w):
+    CACHE_DIR.mkdir(exist_ok=True)
+    _watch_path().write_text(json.dumps(w, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def _pct(frm, to):
+    if frm in (None, 0):
+        return None
+    return (frm - to) / frm * 100.0
+
+
+def cmd_watch(args, lang):
+    """Watch one or more models for API price drops.
+
+    `--once` performs a single check (ideal for cron); without it the CLI
+    loops every `--interval` seconds until Ctrl+C. History lives in
+    ~/.tokenprices/watch.json: the first check records a baseline, and an
+    alert fires whenever a price drops below the previous minimum by at
+    least `--drop` percent.
+    """
+    t = I18N[lang]
+    w = _load_watch()
+
+    if args.watch_list:
+        if not w:
+            print(t["no_match"])
+            return 0
+        rows = [{"model": mid, "provider": rec.get("provider", ""),
+                 "watch_base": fmt(rec.get("base_in"), lang),
+                 "watch_min": fmt(rec.get("min_in"), lang),
+                 "watch_now": fmt(rec.get("cur_in"), lang),
+                 "watch_checks": str(rec.get("checks", 0))} for mid, rec in sorted(w.items())]
+        print(t["watch_list"] + ":")
+        print_table(rows, ["model", "provider", "watch_base", "watch_min", "watch_now", "watch_checks"], lang)
+        return 0
+
+    if args.watch_remove:
+        removed = []
+        for q in args.watch_remove:
+            ql = q.lower()
+            exact = [k for k in w if k.lower() == ql]
+            if exact:
+                removed.append(exact[0])
+                continue
+            fuzzy = [k for k in w if ql in k.lower()]
+            if fuzzy:
+                removed.append(fuzzy[0])
+        for k in removed:
+            del w[k]
+        if removed:
+            _save_watch(w)
+            print("{0}: {1}".format(t["watch_removed"], ", ".join(removed)))
+        else:
+            print(t["no_match"])
+        return 0
+
+    if len(args.query) < 1:
+        print("{0}: `tokenprices watch <model> [--interval N] [--drop N] [--once]`"
+              .format(t["error"]), file=sys.stderr)
+        return 1
+
+    query = args.query[0]
+    source = args.source
+
+    def fetch_now():
+        # Watch needs fresh prices, so bypass the 12h cache.
+        if source == "openrouter":
+            return fetch_openrouter()
+        if source == "litellm":
+            return fetch_litellm()
+        return [{"id": d["id"], "provider": d["provider"], "in": d["in"], "out": d["out"],
+                 "ctx": d["ctx"], "src": "domestic"} for d in DOMESTIC]
+
+    while True:
+        models = fetch_now()
+        hits = resolve(models, query)
+        if not hits:
+            print("{0}: {1}".format(t["no_match"], query), file=sys.stderr)
+            return 1
+        m = hits[0]
+        mid = m["id"]
+        cur_in, cur_out = m.get("in"), m.get("out")
+        now = time.strftime("%Y-%m-%d %H:%M:%S")
+        rec = w.get(mid)
+        if rec is None:
+            # First sighting: record the baseline, no alert yet.
+            rec = {"provider": m.get("provider", ""),
+                   "base_in": cur_in, "base_out": cur_out,
+                   "min_in": cur_in, "min_out": cur_out,
+                   "checks": 0, "alerts": []}
+            w[mid] = rec
+            print("⚙️  {0} ({1}): IN {2} / OUT {3}".format(
+                t["watch_baseline"], mid, fmt(cur_in, lang), fmt(cur_out, lang)))
+            fresh = True
+        else:
+            fresh = False
+        rec["checks"] = rec.get("checks", 0) + 1
+        rec["cur_in"], rec["cur_out"] = cur_in, cur_out
+        rec["last_check"] = now
+
+        alerts = []
+        for key, cur, min_key in (("in", cur_in, "min_in"), ("out", cur_out, "min_out")):
+            prev = rec.get(min_key)
+            if cur is not None and prev is not None and cur < prev:
+                pct = _pct(prev, cur)
+                if pct is not None and pct >= args.drop:
+                    alerts.append((key, prev, cur, pct))
+                rec[min_key] = cur  # always track the new minimum
+        rec.setdefault("alerts", [])
+
+        if alerts:
+            for key, frm, to, pct in alerts:
+                label = t["watch_in"] if key == "in" else t["watch_out"]
+                print("🔔 {0} {1} · {2} ${3} → ${4}  (-{5:.1f}%)".format(
+                    t["watch_drop"], mid, label, fmt(frm, lang), fmt(to, lang), pct))
+                rec["alerts"].append({"at": now, "side": key,
+                                      "from": frm, "to": to, "drop_pct": round(pct, 2)})
+        elif not fresh:
+            print("✓ {0} ({1})".format(mid, t["watch_no_change"]))
+
+        _save_watch(w)
+        if args.once:
+            break
+        print("  {0}: {1} · {2}: {3} s".format(
+            t["watch_checked"], now, t["watch_hint"], args.interval))
+        try:
+            time.sleep(args.interval)
+        except KeyboardInterrupt:
+            print()
+            break
+    return 0
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(
         prog="tokenprices",
         description="Live LLM API price board: 400+ models, compare, cost calculator, HTML report. EN / 中文.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter)
     ap.add_argument("mode", nargs="?", default="list",
-                    choices=["list", "search", "compare", "cost", "top"],
-                    help="command: list | search | compare | cost | top")
+                    choices=["list", "search", "compare", "cost", "top", "watch"],
+                    help="command: list | search | compare | cost | top | watch")
     ap.add_argument("query", nargs="*", help="model name / list of model ids")
     ap.add_argument("--source", choices=["openrouter", "litellm", "domestic"], default="openrouter",
                     help="data source (domestic = direct official reference prices)")
@@ -392,6 +555,15 @@ def main(argv=None):
     ap.add_argument("--in", dest="in_tokens", type=int, default=1000, help="input tokens for cost")
     ap.add_argument("--out", dest="out_tokens", type=int, default=500, help="output tokens for cost")
     ap.add_argument("--calls", type=int, default=1, help="number of calls for cost")
+    ap.add_argument("--interval", type=int, default=3600, help="watch loop interval in seconds")
+    ap.add_argument("--drop", type=float, default=0.0,
+                    help="watch alert threshold: report drops of at least N%")
+    ap.add_argument("--once", action="store_true",
+                    help="watch: single check (cron-friendly); default loops forever")
+    ap.add_argument("--list", dest="watch_list", action="store_true",
+                    help="watch: list watched models")
+    ap.add_argument("--remove", dest="watch_remove", nargs="+", metavar="MODEL",
+                    help="watch: stop watching the given models")
     ap.add_argument("--json", metavar="FILE", help="export matched models as JSON")
     ap.add_argument("--html", metavar="FILE", help="render a share-ready HTML price report")
     args = ap.parse_args(argv)
@@ -399,6 +571,11 @@ def main(argv=None):
     t = I18N[lang]
 
     try:
+        mode = args.mode
+        if mode == "watch":
+            # watch fetches fresh prices itself, so skip the shared cache load
+            return cmd_watch(args, lang)
+
         if args.offline:
             cache = CACHE_DIR / ("cache_" + args.source + ".json")
             if not cache.exists():
